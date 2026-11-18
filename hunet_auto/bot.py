@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
+
+from .cleanup import PROFILE_DIR_NAME, remove_browser_app_shortcuts
 
 BASE_URL = os.environ.get("HUNET_BASE_URL", "https://philips.hunet.co.kr").rstrip("/")
 LOGIN_URL = BASE_URL + "/edu/Login/LoginGate"
@@ -181,8 +184,9 @@ class HunetBot:
         self.headless = headless
         self.keep_open = keep_open
 
-        self.browser = None
+        self.browser = None  # 임시 프로필로 실행한 경우에만 사용
         self.context = None
+        self._context_closed = False
         self.page: Optional[Page] = None
         self.last_dialog: Optional[str] = None
         self._dialog_pages: list = []
@@ -270,29 +274,80 @@ class HunetBot:
             loc.evaluate("el => el.click()")
 
     # ------------------------------------------------------- 브라우저 ---
-    def _launch_browser(self, pw):
+    @staticmethod
+    def _profile_dir(key: str) -> str:
+        base = os.environ.get("HUNET_PROFILE_ROOT")
+        if not base:
+            if sys.platform == "win32":
+                base = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "HunetAutoStudy")
+            else:
+                base = os.path.join(os.path.expanduser("~"), ".cache", "HunetAutoStudy")
+        return os.path.join(base, f"{PROFILE_DIR_NAME}_{key}")
+
+    def _launch_context(self, pw):
+        """브라우저 실행.
+
+        매번 새 임시 프로필을 쓰면 회사 Edge 정책이 실행할 때마다 웹앱(Yammer 등)을 다시 설치하면서
+        바탕화면에 바로가기를 만든다. 그래서 이 프로그램 전용 프로필을 계속 재사용한다.
+        """
         args = [] if self.headless else ["--start-maximized"]
+        ctx_opts = {"locale": "ko-KR"}
+        if self.headless:
+            ctx_opts["viewport"] = {"width": 1600, "height": 1000}
+        else:
+            ctx_opts["no_viewport"] = True
+
         attempts = []
         custom = os.environ.get("HUNET_BROWSER_PATH")
         if custom:
-            attempts.append(("지정한 브라우저", {"executable_path": custom}))
+            attempts.append(("custom", "지정한 브라우저", {"executable_path": custom}))
         attempts += [
-            ("Microsoft Edge", {"channel": "msedge"}),
-            ("Google Chrome", {"channel": "chrome"}),
-            ("Chromium", {}),
+            ("msedge", "Microsoft Edge", {"channel": "msedge"}),
+            ("chrome", "Google Chrome", {"channel": "chrome"}),
+            ("chromium", "Chromium", {}),
         ]
         last_error = None
-        for name, kwargs in attempts:
+        for key, name, kwargs in attempts:
             try:
-                browser = pw.chromium.launch(headless=self.headless, args=args, **kwargs)
+                context = pw.chromium.launch_persistent_context(
+                    self._profile_dir(key), headless=self.headless, args=args, **kwargs, **ctx_opts
+                )
                 self.log(f"브라우저 실행: {name}")
-                return browser
+                return context
             except PlaywrightError as e:
+                last_error = e
+            try:  # 전용 프로필을 쓸 수 없으면(다른 창에서 사용 중 등) 임시 프로필로 실행
+                self.browser = pw.chromium.launch(headless=self.headless, args=args, **kwargs)
+                self.log(f"브라우저 실행: {name} (임시 프로필)")
+                return self.browser.new_context(**ctx_opts)
+            except PlaywrightError as e:
+                self.browser = None
                 last_error = e
         raise RuntimeError(
             "브라우저를 실행할 수 없습니다. Microsoft Edge 또는 Chrome 이 설치되어 있는지 확인하세요.\n"
             f"({last_error})"
         )
+
+    def _on_context_close(self, *_args) -> None:
+        self._context_closed = True
+
+    # ------------------------------------------------- 바로가기 정리 ---
+    def _clean_shortcuts(self) -> None:
+        n = remove_browser_app_shortcuts()
+        if n:
+            self.log(f"브라우저가 만든 웹앱 바로가기 {n}개를 정리했습니다.")
+
+    def _start_shortcut_cleaner(self) -> threading.Event:
+        """브라우저 실행 후 3분 동안 3초마다 바로가기를 확인해 지운다."""
+        finished = threading.Event()
+
+        def loop():
+            deadline = time.time() + 180
+            while not finished.wait(3) and time.time() < deadline:
+                self._clean_shortcuts()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return finished
 
     # ------------------------------------------------------- 1. 로그인 ---
     def login(self) -> None:
@@ -479,11 +534,11 @@ class HunetBot:
 
     # ------------------------------------------------------- 대기 ---
     def hold(self) -> None:
-        if self.browser is None or self.context is None:
+        if self.context is None:
             return
         self.log("여기까지 완료. 브라우저를 닫거나 [중지]를 누르면 종료됩니다.")
         while not self.stop_event.is_set():
-            if not self.browser.is_connected():
+            if self._context_closed or (self.browser is not None and not self.browser.is_connected()):
                 break
             pages = [p for p in self.context.pages if not p.is_closed()]
             if not pages:
@@ -496,64 +551,79 @@ class HunetBot:
     # ------------------------------------------------------- 실행 ---
     def run(self) -> RunResult:
         result = RunResult()
-        with sync_playwright() as pw:
-            self.browser = self._launch_browser(pw)
-            try:
-                if self.headless:
-                    self.context = self.browser.new_context(locale="ko-KR", viewport={"width": 1600, "height": 1000})
-                else:
-                    self.context = self.browser.new_context(locale="ko-KR", no_viewport=True)
-                self.context.on("page", self._attach_dialog_handler)
-                self.page = self.context.new_page()
-                self._attach_dialog_handler(self.page)
+        self._clean_shortcuts()  # 예전 실행에서 남은 바로가기 정리
+        cleaner = self._start_shortcut_cleaner()
+        try:
+            with sync_playwright() as pw:
+                self._run_in_browser(pw, result)
+        finally:
+            cleaner.set()
+            self._clean_shortcuts()
+        return result
 
-                self.login()
-                self._check_stop()
-                self.open_classroom()
-                self._check_stop()
-                result.courses = self.read_courses()
-
-                todo = [c for c in result.courses if not c.complete]
-                if not result.courses:
-                    self._step(3, "skip", "진행중 교육 없음")
-                elif not todo:
-                    self.log("모든 과정의 현황이 100% 입니다. 진행할 학습이 없습니다.")
-                    self._step(3, "skip", "모든 과정 100% 완료")
-                elif todo:
-                    if len(todo) > 1:
-                        self.log(f"미완료 과정 {len(todo)}개 중 첫 번째 과정부터 진행합니다.")
-                    target = todo[0]
-                    study = self.open_study(target)
-                    result.opened = target
-                    result.study_url = study.url
-                    try:
-                        result.study_title = study.title()
-                    except PlaywrightError:
-                        pass
-
-                if self.keep_open:
-                    self.hold()
-            except BotStopped:
-                self._fail_active_step("중지됨")
-                self.log("사용자가 중지했습니다.")
-            except LoginError as e:
-                self._fail_active_step(str(e))
-                raise
-            except Exception as e:  # 로그인 이후 단계 오류: 브라우저는 열어 두고 사용자가 직접 진행 가능
-                if not self.keep_open:
-                    raise
-                result.error = str(e)
-                self._fail_active_step(str(e))
-                self.log(f"오류: {e}")
-                self.log("브라우저는 열어 둡니다. 직접 진행하거나 [중지]를 눌러 종료하세요.")
+    def _run_in_browser(self, pw, result: RunResult) -> None:
+        self.context = self._launch_context(pw)
+        try:
+            self.context.on("close", self._on_context_close)
+            self.context.on("page", self._attach_dialog_handler)
+            self.context.clear_cookies()  # 전용 프로필이라도 매번 새로 로그인
+            pages = [p for p in self.context.pages if not p.is_closed()]
+            self.page = pages[0] if pages else self.context.new_page()
+            for p in pages[1:]:
                 try:
-                    self.hold()
-                except BotStopped:
-                    pass
-            finally:
-                try:
-                    self.browser.close()
+                    p.close()
                 except PlaywrightError:
                     pass
-        return result
+            self._attach_dialog_handler(self.page)
+
+            self.login()
+            self._check_stop()
+            self.open_classroom()
+            self._check_stop()
+            result.courses = self.read_courses()
+
+            todo = [c for c in result.courses if not c.complete]
+            if not result.courses:
+                self._step(3, "skip", "진행중 교육 없음")
+            elif not todo:
+                self.log("모든 과정의 현황이 100% 입니다. 진행할 학습이 없습니다.")
+                self._step(3, "skip", "모든 과정 100% 완료")
+            elif todo:
+                if len(todo) > 1:
+                    self.log(f"미완료 과정 {len(todo)}개 중 첫 번째 과정부터 진행합니다.")
+                target = todo[0]
+                study = self.open_study(target)
+                result.opened = target
+                result.study_url = study.url
+                try:
+                    result.study_title = study.title()
+                except PlaywrightError:
+                    pass
+
+            if self.keep_open:
+                self.hold()
+        except BotStopped:
+            self._fail_active_step("중지됨")
+            self.log("사용자가 중지했습니다.")
+        except LoginError as e:
+            self._fail_active_step(str(e))
+            raise
+        except Exception as e:  # 로그인 이후 단계 오류: 브라우저는 열어 두고 사용자가 직접 진행 가능
+            if not self.keep_open:
+                raise
+            result.error = str(e)
+            self._fail_active_step(str(e))
+            self.log(f"오류: {e}")
+            self.log("브라우저는 열어 둡니다. 직접 진행하거나 [중지]를 눌러 종료하세요.")
+            try:
+                self.hold()
+            except BotStopped:
+                pass
+        finally:
+            for closable in (self.context, self.browser):
+                if closable is not None:
+                    try:
+                        closable.close()
+                    except PlaywrightError:
+                        pass
 
