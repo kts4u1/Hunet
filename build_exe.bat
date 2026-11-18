@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt pyinstaller
 if errorlevel 1 goto fail
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --name HunetAutoStudy main.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --name HunetAutoStudy --icon hunet_auto/assets/app.ico --collect-data customtkinter --collect-data hunet_auto main.py
 if errorlevel 1 goto fail
 echo.
 echo 완료: dist\HunetAutoStudy.exe

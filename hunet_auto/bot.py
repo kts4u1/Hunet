@@ -165,6 +165,7 @@ class HunetBot:
         log: Callable[[str], None] = print,
         ask_2fa: Optional[Callable[[bool], Optional[str]]] = None,
         on_login_success: Optional[Callable[[], None]] = None,
+        on_step: Optional[Callable[[int, str, str], None]] = None,
         stop_event: Optional[threading.Event] = None,
         headless: bool = False,
         keep_open: bool = True,
@@ -174,6 +175,8 @@ class HunetBot:
         self.log = log
         self.ask_2fa = ask_2fa
         self.on_login_success = on_login_success
+        self.on_step = on_step
+        self._active_step: Optional[int] = None
         self.stop_event = stop_event or threading.Event()
         self.headless = headless
         self.keep_open = keep_open
@@ -185,6 +188,17 @@ class HunetBot:
         self._dialog_pages: list = []
 
     # ------------------------------------------------------------ 공통 ---
+    def _step(self, index: int, state: str, detail: str = "") -> None:
+        """진행 단계 알림. index: 0 로그인, 1 메인 화면, 2 나의 강의실, 3 학습창
+        state: active / done / skip / error"""
+        self._active_step = index if state == "active" else None
+        if self.on_step:
+            self.on_step(index, state, detail)
+
+    def _fail_active_step(self, detail: str = "") -> None:
+        if self._active_step is not None:
+            self._step(self._active_step, "error", detail)
+
     def _check_stop(self) -> None:
         if self.stop_event.is_set():
             raise BotStopped()
@@ -283,6 +297,7 @@ class HunetBot:
     # ------------------------------------------------------- 1. 로그인 ---
     def login(self) -> None:
         page = self.page
+        self._step(0, "active", self.user_id)
         self.log("로그인 페이지에 접속합니다...")
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_selector("#ID", state="visible", timeout=30000)
@@ -300,6 +315,7 @@ class HunetBot:
 
         self._wait_login_result()
         self.log("로그인 성공!")
+        self._step(0, "done", self.user_id)
         if self.on_login_success:
             self.on_login_success()
 
@@ -344,6 +360,11 @@ class HunetBot:
 
     # --------------------------------------------- 2. 메인 → 나의 강의실 ---
     def open_classroom(self) -> None:
+        self._step(1, "active")
+        self._open_classroom()
+        self._step(1, "done")
+
+    def _open_classroom(self) -> None:
         page = self.page
         self.log("메인 화면을 불러오는 중...")
         self._wait_quiet(15000)
@@ -382,6 +403,13 @@ class HunetBot:
 
     # -------------------------------------------- 3. 과정 목록 / 현황 확인 ---
     def read_courses(self) -> List[Course]:
+        self._step(2, "active")
+        courses = self._read_courses()
+        todo = sum(1 for c in courses if not c.complete)
+        self._step(2, "done", f"진행중 {len(courses)}개 · 미완료 {todo}개" if courses else "진행중 교육 없음")
+        return courses
+
+    def _read_courses(self) -> List[Course]:
         self.log("나의 강의실(진행중 교육) 목록을 확인합니다...")
         self._wait_quiet(15000)
         self._close_layer_popups()
@@ -404,6 +432,7 @@ class HunetBot:
     # --------------------------------------------------- 4. 학습창 열기 ---
     def open_study(self, course: Course) -> Page:
         page = self.page
+        self._step(3, "active", course.title)
         self.log(f"'{course.title}' 과정의 학습하기를 클릭합니다.")
         popups: list = []
 
@@ -445,6 +474,7 @@ class HunetBot:
         except PlaywrightError:
             pass
         self.log(f"학습창이 열렸습니다: {title or study.url}")
+        self._step(3, "done", course.title)
         return study
 
     # ------------------------------------------------------- 대기 ---
@@ -484,8 +514,11 @@ class HunetBot:
                 result.courses = self.read_courses()
 
                 todo = [c for c in result.courses if not c.complete]
-                if result.courses and not todo:
+                if not result.courses:
+                    self._step(3, "skip", "진행중 교육 없음")
+                elif not todo:
                     self.log("모든 과정의 현황이 100% 입니다. 진행할 학습이 없습니다.")
+                    self._step(3, "skip", "모든 과정 100% 완료")
                 elif todo:
                     if len(todo) > 1:
                         self.log(f"미완료 과정 {len(todo)}개 중 첫 번째 과정부터 진행합니다.")
@@ -501,13 +534,16 @@ class HunetBot:
                 if self.keep_open:
                     self.hold()
             except BotStopped:
+                self._fail_active_step("중지됨")
                 self.log("사용자가 중지했습니다.")
-            except LoginError:
+            except LoginError as e:
+                self._fail_active_step(str(e))
                 raise
             except Exception as e:  # 로그인 이후 단계 오류: 브라우저는 열어 두고 사용자가 직접 진행 가능
                 if not self.keep_open:
                     raise
                 result.error = str(e)
+                self._fail_active_step(str(e))
                 self.log(f"오류: {e}")
                 self.log("브라우저는 열어 둡니다. 직접 진행하거나 [중지]를 눌러 종료하세요.")
                 try:

@@ -22,8 +22,13 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/test_flow.py
 
+      - name: 프로그램 화면 열기 테스트
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/smoke_gui.py
+
       - name: EXE 만들기
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name HunetAutoStudy main.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name HunetAutoStudy --icon hunet_auto/assets/app.ico --collect-data customtkinter --collect-data hunet_auto main.py
 
       - uses: actions/upload-artifact@v4
         with:
