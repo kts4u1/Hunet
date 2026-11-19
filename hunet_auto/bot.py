@@ -22,7 +22,7 @@ from playwright.sync_api import Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
-from .cleanup import PROFILE_DIR_NAME, remove_browser_app_shortcuts
+from .cleanup import PROFILE_DIR_NAME
 
 BASE_URL = os.environ.get("HUNET_BASE_URL", "https://philips.hunet.co.kr").rstrip("/")
 LOGIN_URL = BASE_URL + "/edu/Login/LoginGate"
@@ -331,24 +331,6 @@ class HunetBot:
     def _on_context_close(self, *_args) -> None:
         self._context_closed = True
 
-    # ------------------------------------------------- 바로가기 정리 ---
-    def _clean_shortcuts(self) -> None:
-        n = remove_browser_app_shortcuts()
-        if n:
-            self.log(f"브라우저가 만든 웹앱 바로가기 {n}개를 정리했습니다.")
-
-    def _start_shortcut_cleaner(self) -> threading.Event:
-        """브라우저 실행 후 3분 동안 3초마다 바로가기를 확인해 지운다."""
-        finished = threading.Event()
-
-        def loop():
-            deadline = time.time() + 180
-            while not finished.wait(3) and time.time() < deadline:
-                self._clean_shortcuts()
-
-        threading.Thread(target=loop, daemon=True).start()
-        return finished
-
     # ------------------------------------------------------- 1. 로그인 ---
     def login(self) -> None:
         page = self.page
@@ -551,14 +533,8 @@ class HunetBot:
     # ------------------------------------------------------- 실행 ---
     def run(self) -> RunResult:
         result = RunResult()
-        self._clean_shortcuts()  # 예전 실행에서 남은 바로가기 정리
-        cleaner = self._start_shortcut_cleaner()
-        try:
-            with sync_playwright() as pw:
-                self._run_in_browser(pw, result)
-        finally:
-            cleaner.set()
-            self._clean_shortcuts()
+        with sync_playwright() as pw:
+            self._run_in_browser(pw, result)
         return result
 
     def _run_in_browser(self, pw, result: RunResult) -> None:

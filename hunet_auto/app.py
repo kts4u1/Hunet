@@ -9,13 +9,14 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox
 
 import customtkinter as ctk
 
-from . import config
+from . import __version__, cleanup, config
 from .bot import HunetBot, LoginError, RunResult
 
 ID_PREFIX = "philips-"
@@ -80,6 +81,10 @@ class App:
         self.closing = False
         self.step_states = ["pending"] * len(STEPS)
         self.log_path = os.path.join(config.config_dir(), "last_run.log")
+        self.shortcut_thread: threading.Thread | None = None
+        self.shortcut_watch_until = 0.0
+        self.reported_failures: set = set()
+        self._init_log_file()
 
         family = _pick_font_family(root)
         self.f = {
@@ -107,6 +112,7 @@ class App:
         self._load_saved()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll_job = root.after(100, self._poll_queue)
+        self._watch_shortcuts(15)  # 예전 실행에서 남은 웹앱 바로가기 정리
 
     # ================================================================ UI ===
     def _set_icon(self) -> None:
@@ -169,7 +175,7 @@ class App:
             self.step_widgets.append((circle, num, t, d, detail))
             self._render_step(i, "pending")
 
-        ctk.CTkLabel(side, text="학습지원 문의 1588-6559", font=f["small"], text_color="#7F9DD0").grid(
+        ctk.CTkLabel(side, text=f"v{__version__}  ·  학습지원 문의 1588-6559", font=f["small"], text_color="#7F9DD0").grid(
             row=11, column=0, sticky="w", padx=32, pady=(0, 28))
 
     def _build_main(self) -> None:
@@ -339,6 +345,7 @@ class App:
             self.progress.stop()
             self.progress.configure(mode="determinate")
             self.progress.set(0)
+            self._watch_shortcuts(120)  # 브라우저를 닫은 뒤 늦게 생기는 바로가기도 정리
             if self.pulse_job is not None:
                 self.root.after_cancel(self.pulse_job)
                 self.pulse_job = None
@@ -348,7 +355,7 @@ class App:
         tag = None
         if msg.startswith("오류") or "실패" in msg:
             tag = "err"
-        elif msg.startswith(("로그인 성공", "학습창이 열렸습니다", "로그인 정보를 저장")):
+        elif msg.startswith(("로그인 성공", "학습창이 열렸습니다", "로그인 정보를 저장", "웹앱 바로가기")):
             tag = "ok"
         elif msg.startswith("[사이트 알림]"):
             tag = "warn"
@@ -357,11 +364,53 @@ class App:
         self.log_box.insert("end", msg + "\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        self._log_file(msg)
+
+    def _init_log_file(self) -> None:
         try:
-            with open(self.log_path, "a", encoding="utf-8") as fp:
-                fp.write(f"[{now}] {msg}\n")
+            with open(self.log_path, "w", encoding="utf-8") as fp:
+                fp.write(f"휴넷 자동 학습 v{__version__} — {datetime.datetime.now():%Y-%m-%d %H:%M:%S} 시작\n")
         except OSError:
             pass
+
+    def _log_file(self, msg: str) -> None:
+        """기록 파일(last_run.log)에만 남기는 자세한 기록."""
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as fp:
+                fp.write(f"[{datetime.datetime.now():%H:%M:%S}] {msg}\n")
+        except OSError:
+            pass
+
+    # ---------------------------------------------------- 웹앱 바로가기 정리 ---
+    def _watch_shortcuts(self, seconds: float) -> None:
+        """지금부터 seconds 초 동안(브라우저 실행 중에는 계속) 3초마다 웹앱 바로가기를 검사해 정리."""
+        self.shortcut_watch_until = max(self.shortcut_watch_until, time.time() + seconds)
+        if self.shortcut_thread and self.shortcut_thread.is_alive():
+            return
+        self.shortcut_thread = threading.Thread(target=self._shortcut_loop, daemon=True)
+        self.shortcut_thread.start()
+
+    def _shortcut_loop(self) -> None:
+        first = True
+        last_summary = None
+        while not self.closing:
+            running = self.worker is not None and self.worker.is_alive()
+            if not running and time.time() > self.shortcut_watch_until:
+                break
+            report = cleanup.clean_all()
+            summary = [(f.folder, f.lnk_count, [(s.path, s.action) for s in f.web_apps]) for f in report.folders]
+            if first or report.removed or report.failed or summary != last_summary:
+                for line in report.lines():
+                    self.queue.put(("detail", line))
+            last_summary, first = summary, False
+            if report.removed:
+                names = ", ".join(os.path.basename(s.path) for s in report.removed)
+                self.queue.put(("log", f"웹앱 바로가기 {len(report.removed)}개를 정리했습니다: {names}"))
+            for s in report.failed:
+                if s.path not in self.reported_failures:
+                    self.reported_failures.add(s.path)
+                    self.queue.put(("log", f"오류: 웹앱 바로가기를 지우지 못했습니다 ({os.path.basename(s.path)}) {s.action}"))
+            time.sleep(3)
 
     def _open_log_folder(self) -> None:
         path = config.config_dir()
@@ -469,11 +518,8 @@ class App:
         self._reset_steps()
         self._set_running(True)
         self._set_status("브라우저를 여는 중입니다...", "run")
-        try:
-            with open(self.log_path, "w", encoding="utf-8"):
-                pass
-        except OSError:
-            pass
+        self._log_file("----- 로그인 / 학습 시작 -----")
+        self._watch_shortcuts(180)
 
         headless = os.environ.get("HUNET_HEADLESS") == "1"
         self.worker = threading.Thread(target=self._run_bot, args=(user_id, password, headless), daemon=True)
@@ -536,7 +582,9 @@ class App:
     }
 
     def _handle(self, kind: str, data) -> None:
-        if kind == "log":
+        if kind == "detail":
+            self._log_file(data)
+        elif kind == "log":
             self.log(data)
         elif kind == "step":
             index, state, detail = data
@@ -611,6 +659,12 @@ class App:
             self._destroy()
 
     def _destroy(self) -> None:
+        self.closing = True
+        try:
+            for line in cleanup.clean_all().lines():
+                self._log_file(line)
+        except Exception:
+            pass
         for job in (self.poll_job, self.pulse_job, self.countdown_job):
             if job is not None:
                 try:
